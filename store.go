@@ -11,15 +11,25 @@ import (
 )
 
 type MariadbStore struct {
-	db        *sql.DB
-	tableName string
-	Codecs    []securecookie.Codec
-	Options   *sessions.Options
+	db           *sql.DB
+	databaseName string
+	tableName    string
+	insertStmt   *sql.Stmt
+	updateStmt   *sql.Stmt
+	selectStmt   *sql.Stmt
+	deleteStmt   *sql.Stmt
+	Codecs       []securecookie.Codec
+	Options      *sessions.Options
 }
 
-func NewMariadbStore(db *sql.DB, tableName string, keyPairs ...[]byte) (*MariadbStore, error) {
+func NewMariadbStore(db *sql.DB, databaseName, tableName string, keyPairs ...[]byte) (*MariadbStore, error) {
 	if db == nil {
 		return nil, errors.New("db cannot be nil")
+	}
+
+	createDatabaseQuery := fmt.Sprintf(`CREATE DATABASE IF NOT EXISTS %s`, databaseName)
+	if _, err := db.Exec(createDatabaseQuery); err != nil {
+		return nil, err
 	}
 
 	createTableQuery := fmt.Sprintf(`
@@ -28,15 +38,39 @@ func NewMariadbStore(db *sql.DB, tableName string, keyPairs ...[]byte) (*Mariadb
 			session_data LONGBLOB
 		) ENGINE=InnoDB;
 	`, tableName)
-
 	if _, err := db.Exec(createTableQuery); err != nil {
 		return nil, err
 	}
 
+	insertStmt, err := db.Prepare(fmt.Sprintf(`INSERT INTO %s.%s SET session_data=?`, databaseName, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	updateStmt, err := db.Prepare(fmt.Sprintf(`UPDATE %s.%s SET session_data=?`, databaseName, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	selectStmt, err := db.Prepare(fmt.Sprintf(`SELECT session_data FROM %s.%s WHERE id=?`, databaseName, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	deleteStmt, err := db.Prepare(fmt.Sprintf(`	DELETE FROM %s.%s WHERE id=?`, databaseName, tableName))
+	if err != nil {
+		return nil, err
+	}
+
 	return &MariadbStore{
-		db:        db,
-		tableName: tableName,
-		Codecs:    securecookie.CodecsFromPairs(keyPairs...),
+		db:           db,
+		databaseName: databaseName,
+		tableName:    tableName,
+		insertStmt:   insertStmt,
+		updateStmt:   updateStmt,
+		selectStmt:   selectStmt,
+		deleteStmt:   deleteStmt,
+		Codecs:       securecookie.CodecsFromPairs(keyPairs...),
 		Options: &sessions.Options{
 			Path:   "/",
 			MaxAge: 86400 * 30,
@@ -127,11 +161,7 @@ func (s *MariadbStore) insert(session *sessions.Session) error {
 		return err
 	}
 
-	insertSessionQuery := fmt.Sprintf(`
-		INSERT INTO %s SET session_data=?
-	`, s.tableName)
-
-	res, err := s.db.Exec(insertSessionQuery, encoded)
+	res, err := s.insertStmt.Exec(encoded)
 	if err != nil {
 		return err
 	}
@@ -152,21 +182,13 @@ func (s *MariadbStore) save(session *sessions.Session) error {
 		return err
 	}
 
-	updateSessionQuery := fmt.Sprintf(`
-		UPDATE %s SET session_data=?
-	`, s.tableName)
-
-	_, err = s.db.Exec(updateSessionQuery, encoded)
+	_, err = s.updateStmt.Exec(encoded)
 	return err
 }
 
 func (s *MariadbStore) load(session *sessions.Session) error {
-	getSessionQuery := fmt.Sprintf(`
-		SELECT session_data FROM %s WHERE id=?
-	`, s.tableName)
-
 	var sessionData string
-	if err := s.db.QueryRow(getSessionQuery, session.ID).Scan(&sessionData); err != nil {
+	if err := s.selectStmt.QueryRow(session.ID).Scan(&sessionData); err != nil {
 		return err
 	}
 
@@ -178,10 +200,6 @@ func (s *MariadbStore) load(session *sessions.Session) error {
 }
 
 func (s *MariadbStore) erase(session *sessions.Session) error {
-	deleteSessionQuery := fmt.Sprintf(`
-		DELETE FROM  %s WHERE id=?
-	`, s.tableName)
-
-	_, err := s.db.Exec(deleteSessionQuery, session.ID)
+	_, err := s.deleteStmt.Exec(session.ID)
 	return err
 }
