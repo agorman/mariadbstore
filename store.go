@@ -63,6 +63,13 @@ func (s *MariadbStore) New(r *http.Request, name string) (*sessions.Session, err
 			}
 		}
 	}
+
+	// if the client has a session cookie but the session doesn't exist then create a
+	// new session for the client
+	if err != nil {
+		err = s.insert(session)
+	}
+
 	return session, err
 }
 
