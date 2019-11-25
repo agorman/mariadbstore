@@ -5,21 +5,25 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
 )
 
 type MariadbStore struct {
-	db           *sql.DB
-	databaseName string
-	tableName    string
-	insertStmt   *sql.Stmt
-	updateStmt   *sql.Stmt
-	selectStmt   *sql.Stmt
-	deleteStmt   *sql.Stmt
-	Codecs       []securecookie.Codec
-	Options      *sessions.Options
+	db               *sql.DB
+	databaseName     string
+	tableName        string
+	insertStmt       *sql.Stmt
+	updateStmt       *sql.Stmt
+	selectStmt       *sql.Stmt
+	selectAllStmt    *sql.Stmt
+	deleteStmt       *sql.Stmt
+	Codecs           []securecookie.Codec
+	Options          *sessions.Options
+	stopChan         chan struct{}
+	doneStoppingChan chan struct{}
 }
 
 func NewMariadbStore(db *sql.DB, databaseName, tableName string, keyPairs ...[]byte) (*MariadbStore, error) {
@@ -35,6 +39,7 @@ func NewMariadbStore(db *sql.DB, databaseName, tableName string, keyPairs ...[]b
 	createTableQuery := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			id INT PRIMARY KEY NOT NULL AUTO_INCREMENT,
+			expires INT NOT NULL,
 			session_data LONGBLOB
 		) ENGINE=InnoDB;
 	`, tableName)
@@ -42,12 +47,12 @@ func NewMariadbStore(db *sql.DB, databaseName, tableName string, keyPairs ...[]b
 		return nil, err
 	}
 
-	insertStmt, err := db.Prepare(fmt.Sprintf(`INSERT INTO %s.%s SET session_data=?`, databaseName, tableName))
+	insertStmt, err := db.Prepare(fmt.Sprintf(`INSERT INTO %s.%s SET expires=?, session_data=?`, databaseName, tableName))
 	if err != nil {
 		return nil, err
 	}
 
-	updateStmt, err := db.Prepare(fmt.Sprintf(`UPDATE %s.%s SET session_data=?`, databaseName, tableName))
+	updateStmt, err := db.Prepare(fmt.Sprintf(`UPDATE %s.%s SET expires=?, session_data=?`, databaseName, tableName))
 	if err != nil {
 		return nil, err
 	}
@@ -57,28 +62,44 @@ func NewMariadbStore(db *sql.DB, databaseName, tableName string, keyPairs ...[]b
 		return nil, err
 	}
 
+	selectAllStmt, err := db.Prepare(fmt.Sprintf(`SELECT id, expires FROM %s.%s`, databaseName, tableName))
+	if err != nil {
+		return nil, err
+	}
+
 	deleteStmt, err := db.Prepare(fmt.Sprintf(`	DELETE FROM %s.%s WHERE id=?`, databaseName, tableName))
 	if err != nil {
 		return nil, err
 	}
 
-	return &MariadbStore{
-		db:           db,
-		databaseName: databaseName,
-		tableName:    tableName,
-		insertStmt:   insertStmt,
-		updateStmt:   updateStmt,
-		selectStmt:   selectStmt,
-		deleteStmt:   deleteStmt,
-		Codecs:       securecookie.CodecsFromPairs(keyPairs...),
+	s := &MariadbStore{
+		db:            db,
+		databaseName:  databaseName,
+		tableName:     tableName,
+		insertStmt:    insertStmt,
+		updateStmt:    updateStmt,
+		selectStmt:    selectStmt,
+		selectAllStmt: selectAllStmt,
+		deleteStmt:    deleteStmt,
+		Codecs:        securecookie.CodecsFromPairs(keyPairs...),
 		Options: &sessions.Options{
 			Path:   "/",
 			MaxAge: 86400 * 30,
 		},
-	}, nil
+		stopChan:         make(chan struct{}),
+		doneStoppingChan: make(chan struct{}),
+	}
+
+	s.cleanExpiredSessions()
+	go s.loop()
+
+	return s, nil
 }
 
 func (s *MariadbStore) Close() {
+	s.stopChan <- struct{}{}
+	<-s.doneStoppingChan
+
 	s.insertStmt.Close()
 	s.updateStmt.Close()
 	s.selectStmt.Close()
@@ -117,7 +138,7 @@ func (s *MariadbStore) New(r *http.Request, name string) (*sessions.Session, err
 func (s *MariadbStore) Save(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
 	// Delete if max-age is <= 0
 	if session.Options.MaxAge <= 0 {
-		if err := s.erase(session); err != nil {
+		if err := s.erase(session.ID); err != nil {
 			return err
 		}
 		http.SetCookie(w, sessions.NewCookie(session.Name(), "", session.Options))
@@ -134,8 +155,7 @@ func (s *MariadbStore) Save(r *http.Request, w http.ResponseWriter, session *ses
 		}
 	}
 
-	encoded, err := securecookie.EncodeMulti(session.Name(), session.ID,
-		s.Codecs...)
+	encoded, err := securecookie.EncodeMulti(session.Name(), session.ID, s.Codecs...)
 	if err != nil {
 		return err
 	}
@@ -162,13 +182,54 @@ func (s *MariadbStore) MaxLength(l int) {
 	}
 }
 
+func (s *MariadbStore) loop() {
+	t := time.NewTicker(time.Hour * 24)
+
+	for {
+		select {
+		case <-t.C:
+			s.cleanExpiredSessions()
+		case <-s.stopChan:
+			s.doneStoppingChan <- struct{}{}
+			return
+		}
+	}
+}
+
+func (s *MariadbStore) cleanExpiredSessions() error {
+	now := time.Now().Unix()
+
+	rows, err := s.selectAllStmt.Query()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var expires int64
+		err := rows.Scan(&id, &expires)
+		if err != nil {
+			return err
+		}
+
+		if now > expires {
+			if err := s.erase(id); err != nil {
+				return err
+			}
+		}
+	}
+	return rows.Err()
+}
+
 func (s *MariadbStore) insert(session *sessions.Session) error {
 	encoded, err := securecookie.EncodeMulti(session.Name(), session.Values, s.Codecs...)
 	if err != nil {
 		return err
 	}
 
-	res, err := s.insertStmt.Exec(encoded)
+	expires := time.Now().Add(time.Second * time.Duration(session.Options.MaxAge)).Unix()
+
+	res, err := s.insertStmt.Exec(expires, encoded)
 	if err != nil {
 		return err
 	}
@@ -189,7 +250,9 @@ func (s *MariadbStore) save(session *sessions.Session) error {
 		return err
 	}
 
-	_, err = s.updateStmt.Exec(encoded)
+	expires := time.Now().Add(time.Second * time.Duration(session.Options.MaxAge)).Unix()
+
+	_, err = s.updateStmt.Exec(expires, encoded)
 	return err
 }
 
@@ -206,7 +269,7 @@ func (s *MariadbStore) load(session *sessions.Session) error {
 	return nil
 }
 
-func (s *MariadbStore) erase(session *sessions.Session) error {
-	_, err := s.deleteStmt.Exec(session.ID)
+func (s *MariadbStore) erase(id string) error {
+	_, err := s.deleteStmt.Exec(id)
 	return err
 }
