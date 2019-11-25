@@ -19,8 +19,9 @@ Example
     )
 
     func main() {
-        store, err := mariadbstore.NewMariadbStore(db, "sessions", []byte("secret"))
+        store, err := mariadbstore.NewMariadbStore(db, "database_name, "table_name", []byte("secret"))
         if err != nil {
             panic(err)
         }
+        defer store.Close()
     }

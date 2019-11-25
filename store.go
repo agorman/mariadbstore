@@ -78,6 +78,13 @@ func NewMariadbStore(db *sql.DB, databaseName, tableName string, keyPairs ...[]b
 	}, nil
 }
 
+func (s *MariadbStore) Close() {
+	s.insertStmt.Close()
+	s.updateStmt.Close()
+	s.selectStmt.Close()
+	s.deleteStmt.Close()
+}
+
 func (s *MariadbStore) Get(r *http.Request, name string) (*sessions.Session, error) {
 	return sessions.GetRegistry(r).Get(s, name)
 }
